@@ -1,0 +1,15 @@
+/* Reset the Vite template constraints */
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+#root {
+  max-width: none;   /* remove 1280px cap */
+  padding: 0;        /* remove default padding */
+}
+
+/* Optional: match dashboard bg */
+body {
+  background: #fafafa;
+}
