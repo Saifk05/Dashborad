@@ -222,8 +222,7 @@ export default function DriversPage() {
   // ------------------ DND: onDragEnd handler ------------------
   function onDragEnd(result: DropResult) {
     const { source, destination } = result;
-    const draggableId = result.draggableId;
-    if (!destination) return;
+        if (!destination) return;
     const src = source.droppableId;
     const dst = destination.droppableId;
     const sIdx = source.index;
