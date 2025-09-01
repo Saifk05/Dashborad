@@ -46,7 +46,7 @@ const drvKey = (id: string) => `drv:${id}`
 export default function RoutesPage() {
   const navigate = useNavigate()
 
-  // Only two drivers as requested
+  // Two drivers (sample)
   const [drivers] = useState<Driver[]>([
     { id: 'rakesh', name: 'Rakesh',     status: 'Available', color: '#8b5e3c' }, // brown
     { id: 'jagannath', name: 'Jagannath', status: 'On Route',  color: '#3b82f6' }, // blue
@@ -83,7 +83,7 @@ export default function RoutesPage() {
     return ['All', ...Array.from(s)]
   }, [tasks])
 
-  const originRef = useRef<[number, number] | null>(null)
+  const originRef = useRef<[number, number] | null>(null) // [lng,lat]
 
   const tasksById = useMemo(() => {
     const m: Record<string, Task> = {}
@@ -144,7 +144,7 @@ export default function RoutesPage() {
     }
   }, [])
 
-  /** Load tasks (Apps Script) and seed assignments from sheet */
+  /** Load tasks and seed assignments from sheet */
   useEffect(() => {
     let cancelled = false
     ;(async () => {
@@ -189,13 +189,24 @@ export default function RoutesPage() {
         return [f.geometry.coordinates[0], f.geometry.coordinates[1]] // [lng,lat]
       }
     } catch {}
+    // fallback converts [lat,lng] to [lng,lat]
     return [FALLBACK_LAUNDRY_LATLNG[1], FALLBACK_LAUNDRY_LATLNG[0]]
   }
 
   function normalizeToGeoJSON(resp: any): { geojson: any; summary: any } {
+    // ORS GeoJSON form
     if (resp && resp.type === 'FeatureCollection' && Array.isArray(resp.features)) {
-      return { geojson: resp, summary: resp?.features?.[0]?.properties?.summary ?? null }
+      const props = resp.features?.[0]?.properties
+      const summary = props?.summary ?? props?.segments?.reduce(
+        (acc: any, s: any) => ({
+          distance: (acc?.distance ?? 0) + (s?.distance ?? 0),
+          duration: (acc?.duration ?? 0) + (s?.duration ?? 0),
+        }),
+        { distance: 0, duration: 0 }
+      )
+      return { geojson: resp, summary }
     }
+    // ORS JSON form
     const route = resp?.routes?.[0]
     if (route?.geometry?.type && Array.isArray(route?.geometry?.coordinates)) {
       const feature = {
@@ -228,7 +239,24 @@ export default function RoutesPage() {
     }
   }
 
-  function drawSingleLeg(geojson: any) {
+  /** NEW: fetch a single multi-stop route for a driver (Laundry -> tasks... -> Laundry) */
+  async function fetchMultiStopRoute(coordinates: [number, number][]) {
+    if (coordinates.length < 2) throw new Error('Need at least start and end coordinates')
+    const res = await fetch('https://api.openrouteservice.org/v2/directions/driving-car/geojson', {
+      method: 'POST',
+      headers: { Authorization: ORS_KEY, 'Content-Type': 'application/json', Accept: 'application/geo+json' },
+      body: JSON.stringify({
+        coordinates,
+        preference: 'fastest',
+        units: 'm',
+        instructions: false,
+      }),
+    })
+    if (!res.ok) throw new Error(`Multi-stop route failed: ${res.status} ${await res.text()}`)
+    return normalizeToGeoJSON(await res.json())
+  }
+
+  function drawRoute(geojson: any) {
     const map = mapRef.current
     if (!map) return
     if (routeLayerRef.current) {
@@ -243,25 +271,85 @@ export default function RoutesPage() {
   }
 
   /** Persist a single assignment to the sheet */
-// Replace the old saveAssignmentToSheet with this version
-async function saveAssignmentToSheet(taskId: number, driverName: string) {
-  try {
-    // Use 'no-cors' + text/plain to avoid preflight/CORS issues with Apps Script
-    await fetch(SHEET_API_URL, {
-      method: 'POST',
-      mode: 'no-cors',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ id: taskId, assignedDriver: driverName }), // '' clears
-      cache: 'no-store',
-    })
-    // We can't read the response in no-cors mode, but the script will receive it and update the sheet.
-  } catch (err) {
-    console.error('Failed to save assignment:', err)
+  async function saveAssignmentToSheet(taskId: number, driverName: string) {
+    try {
+      await fetch(SHEET_API_URL, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ id: taskId, assignedDriver: driverName }), // '' clears
+        cache: 'no-store',
+      })
+    } catch (err) {
+      console.error('Failed to save assignment:', err)
+    }
   }
-}
 
+  /** ───────── ROUTE/ETA CLEARING ───────── */
+  function clearEta() {
+    const map = mapRef.current
+    if (!map) return
+    if (routeLayerRef.current) {
+      routeLayerRef.current.remove()
+      routeLayerRef.current = null
+    }
+    map.closePopup()
+  }
 
-  /** Markers colored by assignment */
+  // Optional: quick clear with Escape key
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') clearEta()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  /** NEW: Build ordered coordinates for a given driver */
+  function coordsForDriver(driverId: string): [number, number][] {
+    const start = originRef.current ?? getLaundryLngLat() // [lng,lat]
+    const orderedTaskIds = assign[driverId] || []
+    const waypoints: [number, number][] = []
+
+    for (const tid of orderedTaskIds) {
+      const t = tasksById[tid]
+      if (!t || !isFinite(t.lat) || !isFinite(t.lng)) continue
+      waypoints.push([t.lng, t.lat]) // ORS expects [lng,lat]
+    }
+
+    return [start, ...waypoints, start]
+  }
+
+  /** NEW: Route button handler per driver */
+  async function routeDriver(driverId: string) {
+    const map = mapRef.current
+    if (!map) return
+    const coords = coordsForDriver(driverId)
+    if (coords.length < 2) {
+      L.popup()
+        .setLatLng(map.getCenter())
+        .setContent('No tasks assigned for this driver.')
+        .openOn(map)
+      return
+    }
+    const loadingPos = routeLayerRef.current?.getBounds().getCenter() ?? map.getCenter()
+    const loading = L.popup().setLatLng(loadingPos).setContent('Building multi-stop route…').openOn(map)
+    try {
+      const { geojson, summary } = await fetchMultiStopRoute(coords)
+      drawRoute(geojson)
+      const distKm = summary?.distance != null ? Math.round((summary.distance / 1000) * 10) / 10 : null
+      const durMin = summary?.duration != null ? Math.round(summary.duration / 60) : null
+      loading.setContent(
+        distKm != null && durMin != null
+          ? `<b>Total Route</b><br/>Distance: ${distKm} km<br/>Duration: ${durMin} min`
+          : 'Route ready'
+      )
+    } catch (e: any) {
+      loading.setContent(`Could not build multi-stop route.<br/>${String(e?.message || e)}`)
+    }
+  }
+
+  /** Markers colored by assignment + single-stop ETA on click */
   useEffect(() => {
     const taskLayer = taskLayerRef.current
     if (!taskLayer) return
@@ -306,6 +394,7 @@ async function saveAssignmentToSheet(taskId: number, driverName: string) {
         </div>`
       )
 
+      // Keep single-click ETA for convenience
       marker.on('click', async () => {
         const map = mapRef.current
         if (!map) return
@@ -313,7 +402,7 @@ async function saveAssignmentToSheet(taskId: number, driverName: string) {
         const loading = L.popup().setLatLng([t.lat, t.lng]).setContent('Fetching route…').openOn(map)
         try {
           const { geojson, summary } = await fetchSingleLeg(origin, [t.lng, t.lat])
-          drawSingleLeg(geojson)
+          drawRoute(geojson)
           const distKm = summary?.distance != null ? Math.round((summary.distance / 1000) * 10) / 10 : null
           const durMin = summary?.duration != null ? Math.round(summary.duration / 60) : null
           loading.setContent(
@@ -387,12 +476,13 @@ async function saveAssignmentToSheet(taskId: number, driverName: string) {
       const driverName = drivers.find((d) => d.id === driverId)?.name ?? ''
       setAssign((prev) => {
         const next: Record<string, string[]> = {}
-        // remove from all drivers
+        // remove from all drivers first (a task belongs to only one driver)
         for (const d of drivers) next[d.id] = (prev[d.id] || []).filter((x) => x !== draggableId)
         next[driverId].splice(destination.index, 0, draggableId)
         return next
       })
-      saveAssignmentToSheet(Number(draggableId), driverName) // persist
+      saveAssignmentToSheet(Number(draggableId), driverName)
+      clearEta()
       return
     }
 
@@ -403,7 +493,8 @@ async function saveAssignmentToSheet(taskId: number, driverName: string) {
         ...prev,
         [fromId]: (prev[fromId] || []).filter((_id, i) => i !== source.index),
       }))
-      saveAssignmentToSheet(Number(draggableId), '') // clear in sheet
+      saveAssignmentToSheet(Number(draggableId), '')
+      clearEta()
       return
     }
 
@@ -416,6 +507,7 @@ async function saveAssignmentToSheet(taskId: number, driverName: string) {
         arr.splice(destination.index, 0, m)
         return { ...prev, [dId]: arr }
       })
+      clearEta()
       return
     }
 
@@ -431,7 +523,8 @@ async function saveAssignmentToSheet(taskId: number, driverName: string) {
         return { ...prev, [fromId]: from, [toId]: to }
       })
       const toName = drivers.find((d) => d.id === toId)?.name ?? ''
-      saveAssignmentToSheet(Number(draggableId), toName) // persist
+      saveAssignmentToSheet(Number(draggableId), toName)
+      clearEta()
     }
   }
 
@@ -449,8 +542,8 @@ async function saveAssignmentToSheet(taskId: number, driverName: string) {
   async function clearDriver(dId: string) {
     const toClear = assign[dId] || []
     setAssign((prev) => ({ ...prev, [dId]: [] }))
-    // persist clears
     await Promise.all(toClear.map((tid) => saveAssignmentToSheet(Number(tid), '')))
+    clearEta()
   }
 
   return (
@@ -472,7 +565,7 @@ async function saveAssignmentToSheet(taskId: number, driverName: string) {
             style={{
               background: '#2b2b2b',
               color: '#e5e7eb',
-              border: '1px solid #404040',
+              border: '1px solid #404040',   // ← fixed here
               borderRadius: 8,
               padding: '8px 12px',
               cursor: 'pointer',
@@ -501,20 +594,40 @@ async function saveAssignmentToSheet(taskId: number, driverName: string) {
                     <div style={{ fontSize: 13, color: d.color }}>{d.status}</div>
                     <div style={{ fontSize: 12, opacity: 0.8 }}>Assigned: {(assign[d.id] || []).length}</div>
                   </div>
-                  <button
-                    onClick={() => clearDriver(d.id)}
-                    style={{
-                      background: '#2b2b2b',
-                      color: '#e5e7eb',
-                      border: '1px solid #404040',
-                      borderRadius: 6,
-                      padding: '6px 10px',
-                      cursor: 'pointer',
-                    }}
-                    title="Clear this driver's tasks"
-                  >
-                    Clear
-                  </button>
+
+                  <div style={{ display: 'grid', gap: 6 }}>
+                    <button
+                      onClick={() => clearDriver(d.id)}
+                      style={{
+                        background: '#2b2b2b',
+                        color: '#e5e7eb',
+                        border: '1px solid #404040',
+                        borderRadius: 6,
+                        padding: '6px 10px',
+                        cursor: 'pointer',
+                      }}
+                      title="Clear this driver's tasks"
+                    >
+                      Clear
+                    </button>
+
+                    {/* NEW: Route button */}
+                    <button
+                      onClick={() => routeDriver(d.id)}
+                      style={{
+                        background: d.color,
+                        color: '#0b0f16',
+                        border: `1px solid ${d.color}`,
+                        borderRadius: 6,
+                        padding: '6px 10px',
+                        cursor: 'pointer',
+                        fontWeight: 600,
+                      }}
+                      title="Draw multi-stop route (Laundry → tasks → Laundry)"
+                    >
+                      Route
+                    </button>
+                  </div>
                 </div>
 
                 <Droppable droppableId={drvKey(d.id)} type="TASK">
@@ -620,6 +733,21 @@ async function saveAssignmentToSheet(taskId: number, driverName: string) {
               }}
             >
               Show on Map
+            </button>
+
+            <button
+              onClick={clearEta}
+              style={{
+                background: '#2b2b2b',
+                color: '#e5e7eb',
+                border: '1px solid #404040',
+                borderRadius: 8,
+                padding: '8px 12px',
+                cursor: 'pointer',
+              }}
+              title="Remove the current route and ETA popup"
+            >
+              Clear ETA
             </button>
           </div>
 
